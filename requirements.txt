@@ -1,0 +1,22 @@
+# Pydantic
+pydantic
+pydantic-settings
+cachetools
+requests
+# Streamlit
+streamlit
+# tesseract OCR
+pytesseract
+# Image processing
+Pillow
+opencv-python
+numpy
+# PDF processing
+PyMuPDF
+# LangGraph and OpenAI
+langgraph
+langchain[openai]
+# Dev
+black
+isort
+ruff
