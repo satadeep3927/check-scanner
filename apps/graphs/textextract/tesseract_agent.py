@@ -1,14 +1,13 @@
 """
-TextExtractAgent: AI Agent for extracting and structuring check data from PDFs and images.
+TesseractAgent: Traditional OCR-based extraction using Tesseract (for comparison/demo).
 """
 
-import base64
-import io
 from pathlib import Path
 from typing import Literal, TypedDict
 
-import fitz  # PyMuPDF
-from langchain_core.messages import HumanMessage
+import cv2
+import numpy as np
+import pytesseract
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from PIL import Image
@@ -31,12 +30,10 @@ class ExtractedField(BaseModel):
 class ExtractedData(BaseModel):
     """Dynamically extracted information from the document."""
 
-    # Common fields with suggested labels
     extracted_fields: list[ExtractedField] = Field(
         description="List of all extracted fields with their labels and values"
     )
 
-    # Additional structured data like item tables
     items: list[dict[str, str]] | None = Field(
         default=None,
         description="List of itemized data if present (e.g., invoice line items with quantity, description, rate, total)",
@@ -54,14 +51,14 @@ class AgentState(TypedDict):
     error: str | None
 
 
-class TextExtractAgent:
-    """AI Agent for extracting and structuring check data from PDFs and images."""
+class TesseractAgent:
+    """Traditional OCR-based agent using Tesseract (for demo/comparison)."""
 
     def __init__(self):
-        """Initialize the TextExtractAgent with LLM and graph."""
+        """Initialize the TesseractAgent with LLM and graph."""
         settings = get_settings()
 
-        # Initialize the LLM with vision capabilities
+        # Initialize the LLM for structuring
         self.llm = ChatOpenAI(
             model=settings.llm_model,
             api_key=get_access_token_from_copilot(),
@@ -74,8 +71,6 @@ class TextExtractAgent:
 
     def _build_graph(self):
         """Build the LangGraph workflow for text extraction and structuring."""
-
-        # Create the graph
         workflow = StateGraph(AgentState)
 
         # Add nodes
@@ -89,139 +84,63 @@ class TextExtractAgent:
 
         return workflow.compile()
 
-    def _encode_image_to_base64(
-        self, image: Image.Image, max_size_kb: int = 400
-    ) -> str:
-        """Encode PIL Image to base64 string for vision API, ensuring size is under max_size_kb."""
-        # Start with high quality
-        quality = 95
-        format_type = "JPEG"
+    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Preprocess image for better OCR results."""
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        while quality > 10:
-            buffer = io.BytesIO()
-            # Convert to RGB if needed for JPEG
-            if image.mode in ("RGBA", "P"):
-                rgb_image = image.convert("RGB")
-            else:
-                rgb_image = image
+        # Apply adaptive thresholding
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
 
-            rgb_image.save(buffer, format=format_type, quality=quality, optimize=True)
-            size_kb = len(buffer.getvalue()) / 1024
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
 
-            if size_kb <= max_size_kb:
-                return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            # Reduce quality for next iteration
-            quality -= 10
-
-        # If still too large, resize the image
-        buffer = io.BytesIO()
-        scale = (max_size_kb * 1024 / len(buffer.getvalue())) ** 0.5
-        new_size = (int(image.width * scale * 0.8), int(image.height * scale * 0.8))
-        resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
-
-        if resized_image.mode in ("RGBA", "P"):
-            resized_image = resized_image.convert("RGB")
-
-        resized_image.save(buffer, format=format_type, quality=85, optimize=True)
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return denoised
 
     def _extract_text_from_image(self, image_path: str) -> str:
-        """Extract text from an image using vision LLM."""
+        """Extract text from an image using Tesseract OCR."""
         try:
-            image = Image.open(image_path)
+            # Load image
+            image = cv2.imread(image_path)
 
-            # Convert image to RGB if needed
-            if image.mode != "RGB":
-                image = image.convert("RGB")
+            if image is None:
+                raise Exception(f"Failed to load image: {image_path}")
 
-            # Encode image to base64
-            image_b64 = self._encode_image_to_base64(image)
+            # Preprocess image
+            processed = self._preprocess_image(image)
 
-            # Use vision LLM to extract text
-            message = HumanMessage(
-                content=[
-                    {
-                        "type": "text",
-                        "text": """Extract all visible text from this check image. 
-                        Include everything you can see: bank name, check number, date, payor name, 
-                        payee name, amount (numerical), amount in words, memo/notes, routing numbers, 
-                        account numbers, and any other text visible on the check.
-                        
-                        Provide the text in a structured format, clearly labeling each field. Don't include anything extra.""",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    },
-                ]
+            # Configure Tesseract
+            custom_config = r"--oem 3 --psm 6"
+
+            # Extract text
+            text = pytesseract.image_to_string(processed, config=custom_config)
+
+            if not text.strip():
+                # Try without preprocessing
+                pil_image = Image.open(image_path)
+                text = pytesseract.image_to_string(pil_image, config=custom_config)
+
+            return text
+
+        except Exception as e:
+            raise Exception(
+                f"Failed to extract text from image using Tesseract: {str(e)}"
             )
 
-            response = self.llm.invoke([message])
-            return str(response.content)
-
-        except Exception as e:
-            raise Exception(f"Failed to extract text from image: {str(e)}")
-
-    def _extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from a scanned PDF using vision LLM."""
-        try:
-            doc = fitz.open(pdf_path)
-            text = ""
-
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-
-                # Convert page to high-resolution image
-                zoom = 2  # 2x zoom for good quality
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
-
-                # Convert to PIL Image
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-                # Encode image to base64
-                image_b64 = self._encode_image_to_base64(img)
-
-                # Use vision LLM to extract text
-                message = HumanMessage(
-                    content=[
-                        {
-                            "type": "text",
-                            "text": """Extract all visible text from this check image. 
-                            Include everything you can see: bank name, check number, date, payor name, 
-                            payee name, amount (numerical), amount in words, memo/notes, routing numbers, 
-                            account numbers, and any other text visible on the check.
-                            
-                            Provide the text in a structured format, clearly labeling each field.""",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                        },
-                    ]
-                )
-
-                response = self.llm.invoke([message])
-                text += str(response.content) + "\n"
-
-            doc.close()
-            return text
-        except Exception as e:
-            raise Exception(f"Failed to extract text from PDF: {str(e)}")
-
     def _extract_text_node(self, state: AgentState) -> AgentState:
-        """Node to extract raw text from the input document."""
+        """Node to extract raw text from the input document using Tesseract."""
         try:
             input_path = state["input_path"]
             input_type = state["input_type"]
 
-            if input_type == "pdf":
-                raw_text = self._extract_text_from_pdf(input_path)
-            elif input_type == "image":
+            if input_type == "image":
                 raw_text = self._extract_text_from_image(input_path)
             else:
-                raise ValueError(f"Unsupported input type: {input_type}")
+                raise ValueError(
+                    f"Tesseract agent only supports images, got: {input_type}"
+                )
 
             state["raw_text"] = raw_text
             state["error"] = None
@@ -233,10 +152,9 @@ class TextExtractAgent:
         return state
 
     def _structure_data_node(self, state: AgentState) -> AgentState:
-        """Node to structure the raw text into CheckData using LLM."""
+        """Node to structure the raw text using LLM."""
         try:
             if state["error"]:
-                # If there was an error in text extraction, skip structuring
                 return state
 
             raw_text = state["raw_text"]
@@ -245,11 +163,11 @@ class TextExtractAgent:
                 state["error"] = "No text extracted from document"
                 return state
 
-            # Use LLM with structured output to extract all information dynamically
+            # Use LLM with structured output
             structured_llm = self.llm.with_structured_output(ExtractedData)
 
             prompt = f"""You are an expert at extracting ALL possible information from financial documents (checks, invoices, receipts, etc.).
-Given the following raw text, extract as much information as possible.
+Given the following raw text extracted via OCR, extract as much information as possible.
 
 Raw Text:
 {raw_text}
@@ -291,7 +209,7 @@ Extract EVERYTHING you can see!
 """
 
             extracted_data = structured_llm.invoke(prompt)
-            # Convert ExtractedData Pydantic model to dict for TypedDict compatibility
+
             if isinstance(extracted_data, ExtractedData):
                 data_dict = extracted_data.model_dump()
                 # Convert list of ExtractedField objects to dictionary
@@ -316,25 +234,23 @@ Extract EVERYTHING you can see!
         self, input_path: str, input_type: Literal["pdf", "image"] | None = None
     ) -> dict:
         """
-        Process a PDF or image file to extract structured check data.
+        Process an image file to extract structured data using Tesseract OCR.
 
         Args:
-            input_path: Path to the PDF or image file
-            input_type: Type of input ("pdf" or "image"). If None, will be inferred from file extension.
+            input_path: Path to the image file
+            input_type: Type of input (only "image" supported). If None, will be inferred.
 
         Returns:
-            Dictionary containing the structured check data or error information
+            Dictionary containing the structured data or error information
         """
         # Infer input type if not provided
         if input_type is None:
             path = Path(input_path)
             ext = path.suffix.lower()
-            if ext == ".pdf":
-                input_type = "pdf"
-            elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]:
+            if ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]:
                 input_type = "image"
             else:
-                return {"error": f"Unsupported file type: {ext}"}
+                return {"error": f"Tesseract agent only supports images. Got: {ext}"}
 
         # Initialize state
         initial_state = AgentState(
