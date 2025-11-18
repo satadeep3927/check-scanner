@@ -9,7 +9,7 @@ streamlit
 pytesseract
 # Image processing
 Pillow
-opencv-python
+opencv-python-headless
 numpy
 # PDF processing
 PyMuPDF
